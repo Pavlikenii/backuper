@@ -10,7 +10,7 @@ from datetime import datetime
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
-SUBREDDIT = os.environ.get("SUBREDDIT", "boltedontits")
+SUBREDDIT = os.environ.get("SUBREDDIT", "boltedontits")  # Replace with your subreddit name
 RSS_URL = f"https://www.reddit.com/r/{SUBREDDIT}/new/.rss"
 SEEN_FILE = "seen.txt"
 FAILED_FILE = "failed.txt"
