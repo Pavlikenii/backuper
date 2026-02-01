@@ -22,7 +22,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run archiver
-        run: python archiver.py
+        run: python -u archiver.py
 
       - name: Commit updated seen.txt
         run: |
