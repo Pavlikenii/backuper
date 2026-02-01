@@ -3,7 +3,7 @@ import requests
 import time
 import os
 
-SUBREDDIT = "yoursubredditname"
+SUBREDDIT = "boltedontits"
 RSS_URL = f"https://www.reddit.com/r/{SUBREDDIT}/new/.rss"
 SEEN_FILE = "seen.txt"
 
