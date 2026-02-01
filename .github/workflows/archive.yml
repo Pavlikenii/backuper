@@ -2,37 +2,95 @@ name: Reddit Wayback Archiver
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # Runs every 10 minutes
+    - cron: "*/5 * * * *"  # Runs every 5 minutes (was */10)
   workflow_dispatch:        # Allows manual run button
 
 permissions:
   contents: write           # REQUIRED to save the text file
 
+# Prevent concurrent runs (avoid git conflicts)
+concurrency:
+  group: archiver
+  cancel-in-progress: false  # Don't cancel - let it finish
+
 jobs:
   run_archiver:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Kill the job if it takes longer than 15 minutes
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 1  # Only need latest commit
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
+          cache: 'pip'  # Cache pip dependencies for faster runs
+      
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+      
       - name: Run Archiver Script
+        id: archiver
+        env:
+          SUBREDDIT: ${{ vars.SUBREDDIT }}  # Set this in repo Settings > Secrets and variables > Variables
         # The -u flag is CRITICAL. It forces logs to show instantly.
         run: python -u archiver.py
-
+        continue-on-error: true
+      
+      - name: Generate Run Summary
+        if: always()
+        run: |
+          echo "## 📦 Archive Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Time:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Schedule:** Every 5 minutes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Count lines in seen.txt
+          if [ -f seen.txt ]; then
+            TOTAL=$(wc -l < seen.txt)
+            echo "**Total Archived:** $TOTAL posts" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Show last 3 archived URLs
+          if [ -f seen.txt ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Recently Archived (Last 3)" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            tail -3 seen.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Show failed attempts if any
+          if [ -f failed.txt ]; then
+            FAILED_COUNT=$(wc -l < failed.txt)
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**⚠️ Failed Attempts:** $FAILED_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Recent Failures" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            tail -5 failed.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+      
       - name: Commit and Push Changes
         run: |
           git config user.name "Wayback Bot"
           git config user.email "bot@users.noreply.github.com"
-          git add seen.txt
+          
+          # Add both seen and failed files if they exist
+          git add seen.txt failed.txt 2>/dev/null || true
+          
           # The "|| exit 0" prevents error if there are no new posts
-          git commit -m "Update archive logs" || exit 0
-          git push
+          git diff --quiet && git diff --staged --quiet || git commit -m "📦 Archive update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+          git push || echo "⚠️ Push failed (possible conflict - will retry next run)"
+      
+      - name: Check for script failures
+        if: steps.archiver.outcome != 'success'
+        run: |
+          echo "::warning::Archiver script encountered errors - check logs above"
+          exit 1
