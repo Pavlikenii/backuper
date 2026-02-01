@@ -2,7 +2,7 @@ name: Reddit Wayback Archiver
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # Runs every 5 minutes (was */10)
+    - cron: "*/5 * * * *"  # Runs every 5 minutes
   workflow_dispatch:        # Allows manual run button
 
 permissions:
@@ -22,7 +22,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # Only need latest commit
+          fetch-depth: 0  # Fetch all history to avoid conflicts
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,7 +36,7 @@ jobs:
       - name: Run Archiver Script
         id: archiver
         env:
-          SUBREDDIT: ${{ vars.SUBREDDIT }}  # Set this in repo Settings > Secrets and variables > Variables
+          SUBREDDIT: ${{ vars.SUBREDDIT }}  # Optional: Set in repo Settings > Variables
         # The -u flag is CRITICAL. It forces logs to show instantly.
         run: python -u archiver.py
         continue-on-error: true
@@ -82,12 +82,26 @@ jobs:
           git config user.name "Wayback Bot"
           git config user.email "bot@users.noreply.github.com"
           
-          # Add both seen and failed files if they exist
-          git add seen.txt failed.txt 2>/dev/null || true
+          # Pull latest changes first to avoid conflicts
+          git pull --rebase origin main || git pull origin main || true
           
-          # The "|| exit 0" prevents error if there are no new posts
-          git diff --quiet && git diff --staged --quiet || git commit -m "📦 Archive update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
-          git push || echo "⚠️ Push failed (possible conflict - will retry next run)"
+          # Add both seen and failed files if they exist
+          git add seen.txt 2>/dev/null || true
+          git add failed.txt 2>/dev/null || true
+          
+          # Check if there are changes to commit
+          if ! git diff --quiet --staged; then
+            git commit -m "📦 Archive update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+            
+            # Try to push, retry with pull if it fails
+            git push || {
+              echo "Push failed, pulling and retrying..."
+              git pull --rebase origin main
+              git push
+            }
+          else
+            echo "No changes to commit"
+          fi
       
       - name: Check for script failures
         if: steps.archiver.outcome != 'success'
