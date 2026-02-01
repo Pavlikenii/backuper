@@ -8,36 +8,42 @@ on:
 permissions:
   contents: write           # REQUIRED to save the text file
 
-# Prevent concurrent runs (avoid git conflicts)
 concurrency:
   group: archiver
-  cancel-in-progress: false  # Don't cancel - let it finish
+  cancel-in-progress: false
 
 jobs:
   run_archiver:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Kill the job if it takes longer than 15 minutes
+    timeout-minutes: 15
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history to avoid conflicts
+          fetch-depth: 0
       
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'  # Cache pip dependencies for faster runs
+          cache: 'pip'
       
+      # FIX: Ensure dependencies exist even if requirements.txt is missing
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt not found, installing manually..."
+            pip install requests feedparser
+          fi
       
       - name: Run Archiver Script
         id: archiver
         env:
-          SUBREDDIT: ${{ vars.SUBREDDIT }}  # Optional: Set in repo Settings > Variables
-        # The -u flag is CRITICAL. It forces logs to show instantly.
+          SUBREDDIT: ${{ vars.SUBREDDIT }}
+        # -u forces unbuffered output so you see logs immediately
         run: python -u archiver.py
         continue-on-error: true
       
@@ -47,53 +53,36 @@ jobs:
           echo "## 📦 Archive Run Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Time:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "**Schedule:** Every 5 minutes" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Count lines in seen.txt
           if [ -f seen.txt ]; then
             TOTAL=$(wc -l < seen.txt)
             echo "**Total Archived:** $TOTAL posts" >> $GITHUB_STEP_SUMMARY
           fi
           
-          # Show last 3 archived URLs
-          if [ -f seen.txt ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Recently Archived (Last 3)" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            tail -3 seen.txt >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          # Show failed attempts if any
           if [ -f failed.txt ]; then
             FAILED_COUNT=$(wc -l < failed.txt)
-            echo "" >> $GITHUB_STEP_SUMMARY
             echo "**⚠️ Failed Attempts:** $FAILED_COUNT" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Recent Failures" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            tail -5 failed.txt >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # If the script failed, show that in the summary
+          if [ "${{ steps.archiver.outcome }}" != "success" ]; then
+             echo "" >> $GITHUB_STEP_SUMMARY
+             echo "🔴 **The Python script crashed or failed.** Check the logs." >> $GITHUB_STEP_SUMMARY
           fi
       
       - name: Commit and Push Changes
+        # Only try to commit if the previous steps ran (even if script failed, we might want to save logs/failed.txt)
         run: |
           git config user.name "Wayback Bot"
           git config user.email "bot@users.noreply.github.com"
           
-          # Pull latest changes first to avoid conflicts
           git pull --rebase origin main || git pull origin main || true
           
-          # Add both seen and failed files if they exist
           git add seen.txt 2>/dev/null || true
           git add failed.txt 2>/dev/null || true
           
-          # Check if there are changes to commit
           if ! git diff --quiet --staged; then
             git commit -m "📦 Archive update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
-            
-            # Try to push, retry with pull if it fails
             git push || {
               echo "Push failed, pulling and retrying..."
               git pull --rebase origin main
@@ -106,5 +95,5 @@ jobs:
       - name: Check for script failures
         if: steps.archiver.outcome != 'success'
         run: |
-          echo "::warning::Archiver script encountered errors - check logs above"
+          echo "::error::Archiver script encountered errors. Please check the 'Run Archiver Script' step logs for details."
           exit 1
