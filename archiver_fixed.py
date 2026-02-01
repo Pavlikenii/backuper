@@ -10,7 +10,7 @@ from datetime import datetime
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
-SUBREDDIT = os.environ.get("SUBREDDIT", "")
+SUBREDDIT = os.environ.get("SUBREDDIT", "boltedontits")
 RSS_URL = f"https://www.reddit.com/r/{SUBREDDIT}/new/.rss"
 SEEN_FILE = "seen.txt"
 FAILED_FILE = "failed.txt"
@@ -19,10 +19,11 @@ FAILED_FILE = "failed.txt"
 USER_AGENT = "Mozilla/5.0 (compatible; RedditWaybackArchiver/1.0; +https://github.com/)"
 HEADERS = {"User-Agent": USER_AGENT}
 
-# ⏳ TIMINGS (Tuned for slow Wayback Machine)
-WAYBACK_TIMEOUT = 90        # Increased to 90 seconds
-SLEEP_BETWEEN = 12          # Wait 12 seconds between posts
-MAX_RETRIES = 3             # Maximum retry attempts for timeouts
+# ⏳ OPTIMIZED TIMINGS
+WAYBACK_TIMEOUT = 45        # Reduced to 45s (was 90s) - fail faster
+SLEEP_BETWEEN = 8           # Reduced to 8s (was 12s) - archive faster
+MAX_RETRIES = 2             # Only 2 retries (was 3) - fail faster
+MAX_POSTS_PER_RUN = 10      # Limit posts per run to avoid going over 5 minutes
 MAX_SEEN_ENTRIES = 10000    # Maximum entries in seen.txt before trimming
 
 # ==========================================
@@ -89,21 +90,20 @@ def log_failed(post_url, status):
         f.write(f"{timestamp}|{post_url}|{status}\n")
 
 def archive(url, retries=MAX_RETRIES):
-    """Sends URL to Wayback Machine with retry logic for timeouts."""
+    """Sends URL to Wayback Machine with quick retry logic."""
     for attempt in range(retries):
         wayback_url = f"https://web.archive.org/save/{url}"
         try:
             r = requests.get(wayback_url, headers=HEADERS, timeout=WAYBACK_TIMEOUT)
             
-            # Handle rate limiting with exponential backoff
+            # Handle rate limiting with shorter backoff
             if r.status_code == 429:
                 if attempt < retries - 1:
-                    wait = (2 ** attempt) * 10 + random.uniform(0, 5)
-                    log(f"   ⏳ Rate limited (429). Waiting {wait:.1f}s before retry {attempt + 2}/{retries}...")
+                    wait = 15 + random.uniform(0, 10)
+                    log(f"   ⏳ Rate limited. Waiting {wait:.1f}s...")
                     time.sleep(wait)
                     continue
                 else:
-                    log(f"   ❌ Rate limited after {retries} attempts")
                     return 429
             
             # Success!
@@ -115,31 +115,26 @@ def archive(url, retries=MAX_RETRIES):
             
         except requests.exceptions.Timeout:
             if attempt < retries - 1:
-                wait = 10 + (attempt * 5)
-                log(f"   ⏱️ Timeout (attempt {attempt + 1}/{retries}). Retrying in {wait}s...")
-                time.sleep(wait)
+                log(f"   ⏱️ Timeout. Retry {attempt + 2}/{retries}...")
+                time.sleep(5)
                 continue
             else:
-                log(f"   ❌ Failed after {retries} timeout attempts")
                 return "Timeout"
                 
-        except requests.exceptions.ConnectionError as e:
+        except requests.exceptions.ConnectionError:
             if attempt < retries - 1:
-                wait = 10 + (attempt * 5)
-                log(f"   🔌 Connection error (attempt {attempt + 1}/{retries}). Retrying in {wait}s...")
-                time.sleep(wait)
+                log(f"   🔌 Connection error. Retry {attempt + 2}/{retries}...")
+                time.sleep(5)
                 continue
             else:
-                log(f"   ❌ Connection failed after {retries} attempts")
                 return "Connection Error"
                 
         except Exception as e:
             if attempt < retries - 1:
-                wait = 10 + (attempt * 5)
-                log(f"   ⚠️ Error: {str(e)[:100]}. Retrying in {wait}s...")
-                time.sleep(wait)
+                log(f"   ⚠️ Error. Retry {attempt + 2}/{retries}...")
+                time.sleep(5)
                 continue
-            return f"Error: {str(e)[:100]}"
+            return f"Error: {str(e)[:50]}"
     
     return "Max retries exceeded"
 
@@ -187,6 +182,11 @@ def main():
             skipped_count += 1
             continue
         
+        # LIMIT: Stop if we've already processed MAX_POSTS_PER_RUN
+        if new_count + failed_count >= MAX_POSTS_PER_RUN:
+            log(f"⏸️ Reached limit of {MAX_POSTS_PER_RUN} posts per run. Remaining posts will be processed next time.")
+            break
+        
         log(f"🆕 Processing: {post_url}")
         
         # Attempt Archive
@@ -215,7 +215,7 @@ def main():
     
     # Always log completion time for visibility
     if new_count == 0 and failed_count == 0:
-        log(f"   ℹ️ No new posts found - next check in 10 minutes")
+        log(f"   ℹ️ No new posts found - next check in 5 minutes")
 
 if __name__ == "__main__":
     main()
