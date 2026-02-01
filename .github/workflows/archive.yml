@@ -71,26 +71,34 @@ jobs:
           fi
       
       - name: Commit and Push Changes
-        # Only try to commit if the previous steps ran (even if script failed, we might want to save logs/failed.txt)
         run: |
           git config user.name "Wayback Bot"
           git config user.email "bot@users.noreply.github.com"
           
-          git pull --rebase origin main || git pull origin main || true
+          # 1. Stage the files immediately (Fixes 'untracked files' error)
+          git add seen.txt failed.txt 2>/dev/null || true
           
-          git add seen.txt 2>/dev/null || true
-          git add failed.txt 2>/dev/null || true
-          
-          if ! git diff --quiet --staged; then
-            git commit -m "📦 Archive update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
-            git push || {
-              echo "Push failed, pulling and retrying..."
-              git pull --rebase origin main
-              git push
-            }
-          else
-            echo "No changes to commit"
+          # 2. Check if we actually have changes to save
+          if git diff --quiet --staged; then
+            echo "No changes to commit. Exiting."
+            exit 0
           fi
+
+          # 3. Commit LOCALLY first (Fixes 'cannot pull with unstaged changes' error)
+          git commit -m "📦 Archive update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
+          
+          # 4. Pull remote changes and reapply our commit on top
+          # We use --rebase to keep history clean
+          # We use -Xtheirs to favor the bot's current run if lines conflict
+          echo "Pulling latest changes..."
+          if ! git pull --rebase -Xtheirs origin main; then
+            echo "⚠️ Rebase failed. Attempting standard merge..."
+            git rebase --abort
+            git pull -Xtheirs origin main
+          fi
+          
+          # 5. Push the result
+          git push
       
       - name: Check for script failures
         if: steps.archiver.outcome != 'success'
