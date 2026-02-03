@@ -15,19 +15,19 @@ RSS_URL = f"https://www.reddit.com/r/{SUBREDDIT}/new/.rss"
 SEEN_FILE = "seen.txt"
 FAILED_FILE = "failed.txt"
 
-USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) WaybackArchiver/2.0 (github.com/action; r/{SUBREDDIT})"
+USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) MultiArchiveBot/1.0 (github.com/action; r/{SUBREDDIT})"
 HEADERS = {
     "User-Agent": USER_AGENT,
-    "Accept": "application/rss+xml, application/xml, text/xml"
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 }
 
-# ⏳ IMPROVED TIMINGS
-WAYBACK_TIMEOUT = 60         # Increased timeout
-SLEEP_BETWEEN = 12           # Longer delays between requests
-MAX_RETRIES = 3              # More retries
-MAX_POSTS_PER_RUN = 5        # REDUCED: Process fewer posts per run to avoid timeout
+# ⏳ TIMINGS
+ARCHIVE_TIMEOUT = 45
+SLEEP_BETWEEN = 15
+MAX_RETRIES = 2  # Reduced since we try multiple services
+MAX_POSTS_PER_RUN = 5
 MAX_SEEN_ENTRIES = 10000
-CIRCUIT_BREAKER_THRESHOLD = 5  # Stop after 5 consecutive 523 errors
+CIRCUIT_BREAKER_THRESHOLD = 5
 
 def log(msg):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -63,79 +63,141 @@ def load_seen():
             seen_urls.add(line)
     return seen_urls
 
-def append_seen(post_url):
+def append_seen(post_url, service="unknown"):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     with open(SEEN_FILE, "a") as f:
-        f.write(f"{timestamp}|{post_url}\n")
+        f.write(f"{timestamp}|{post_url}|{service}\n")
 
-def log_failed(post_url, status, skip_archive=False):
+def log_failed(post_url, status):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    skip_marker = "|SKIP" if skip_archive else ""
     with open(FAILED_FILE, "a") as f:
-        f.write(f"{timestamp}|{post_url}|{status}{skip_marker}\n")
+        f.write(f"{timestamp}|{post_url}|{status}\n")
 
-def archive(url, retries=MAX_RETRIES):
-    """
-    Attempt to archive a URL to the Wayback Machine.
-    Returns: status code (int), error message (str), or None
-    """
+def archive_wayback(url, retries=MAX_RETRIES):
+    """Try archiving with Wayback Machine"""
     for attempt in range(retries):
         wayback_url = f"https://web.archive.org/save/{url}"
         
         try:
-            log(f"   🔄 Attempt {attempt + 1}/{retries}")
-            r = requests.get(wayback_url, headers=HEADERS, timeout=WAYBACK_TIMEOUT, allow_redirects=True)
+            log(f"      [Wayback] Attempt {attempt + 1}/{retries}")
+            r = requests.get(wayback_url, headers=HEADERS, timeout=ARCHIVE_TIMEOUT, allow_redirects=True)
             
-            # Handle rate limiting
             if r.status_code == 429:
                 if attempt < retries - 1:
-                    wait = 30 + random.uniform(0, 20)
-                    log(f"   ⏳ Rate limited (429). Waiting {wait:.1f}s...")
+                    wait = 20 + random.uniform(0, 10)
+                    log(f"      ⏳ Rate limited. Waiting {wait:.1f}s...")
                     time.sleep(wait)
                     continue
-                else: 
-                    return 429
+                return (429, None)
             
-            # Success cases
             if r.status_code == 200:
-                return 200
+                return (200, r.url)
             
-            # Origin unreachable - Wayback can't access Reddit
             if r.status_code == 523:
-                log(f"   ⚠️  523 Origin Unreachable - Wayback can't reach Reddit")
-                if attempt < retries - 1:
-                    wait = 20 + random.uniform(0, 15)
-                    log(f"   ⏳ Waiting {wait:.1f}s before retry...")
-                    time.sleep(wait)
-                    continue
-                return 523
+                log(f"      ⚠️  523 Origin Unreachable")
+                return (523, None)  # Don't retry 523
             
-            # Other error codes
-            log(f"   ⚠️  Unexpected status: {r.status_code}")
             if attempt < retries - 1:
-                time.sleep(10)
+                time.sleep(5)
                 continue
-            return r.status_code
-            
-        except requests.exceptions.Timeout:
-            log(f"   ⏰ Request timeout")
-            if attempt < retries - 1:
-                time.sleep(10)
-                continue
-            return "Timeout"
+            return (r.status_code, None)
             
         except Exception as e:
-            error_msg = str(e)[:100]
-            log(f"   ❌ Exception: {error_msg}")
             if attempt < retries - 1:
-                time.sleep(10)
+                time.sleep(5)
                 continue
-            return f"Error: {error_msg}"
+            return (f"Error: {str(e)[:50]}", None)
     
-    return "Max retries exceeded"
+    return ("Max retries", None)
+
+def archive_today(url, retries=MAX_RETRIES):
+    """Try archiving with Archive.today"""
+    for attempt in range(retries):
+        try:
+            log(f"      [Archive.today] Attempt {attempt + 1}/{retries}")
+            
+            archive_submit_url = "https://archive.ph/submit/"
+            
+            payload = {
+                'url': url,
+                'anyway': '1'
+            }
+            
+            headers = {
+                'User-Agent': USER_AGENT,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': 'https://archive.ph',
+                'Referer': 'https://archive.ph/'
+            }
+            
+            r = requests.post(
+                archive_submit_url,
+                data=payload,
+                headers=headers,
+                timeout=ARCHIVE_TIMEOUT,
+                allow_redirects=True
+            )
+            
+            if r.status_code == 200 and 'archive.ph' in r.url:
+                return (200, r.url)
+            
+            if r.status_code == 429:
+                if attempt < retries - 1:
+                    wait = 20 + random.uniform(0, 10)
+                    log(f"      ⏳ Rate limited. Waiting {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+                return (429, None)
+            
+            if attempt < retries - 1:
+                time.sleep(5)
+                continue
+            return (r.status_code, None)
+            
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(5)
+                continue
+            return (f"Error: {str(e)[:50]}", None)
+    
+    return ("Max retries", None)
+
+def archive_multi_service(url):
+    """
+    Try multiple archive services with fallback
+    Returns: (success: bool, service: str, status: any)
+    """
+    
+    # Try Wayback Machine first
+    log(f"   🌐 Trying Wayback Machine...")
+    status, archive_url = archive_wayback(url)
+    
+    if status == 200:
+        log(f"   ✅ Wayback SUCCESS")
+        log(f"   📦 {archive_url}")
+        return (True, "wayback", status)
+    
+    log(f"   ❌ Wayback failed: {status}")
+    
+    # If Wayback fails, try Archive.today
+    log(f"   🌐 Trying Archive.today...")
+    time.sleep(3)  # Brief pause between services
+    status2, archive_url2 = archive_today(url)
+    
+    if status2 == 200:
+        log(f"   ✅ Archive.today SUCCESS")
+        log(f"   📦 {archive_url2}")
+        return (True, "archive.today", status2)
+    
+    log(f"   ❌ Archive.today failed: {status2}")
+    
+    # Both failed
+    return (False, "all_failed", f"wayback:{status}|archive.today:{status2}")
 
 def main():
-    log(f"--- 🚀 STARTING ARCHIVER FOR r/{SUBREDDIT} ---")
+    log(f"--- 🚀 STARTING MULTI-SERVICE ARCHIVER FOR r/{SUBREDDIT} ---")
+    log(f"📍 Will try: Wayback Machine → Archive.today")
     
     if not validate_subreddit():
         sys.exit(1)
@@ -147,10 +209,10 @@ def main():
     try:
         resp = requests.get(RSS_URL, headers=HEADERS, timeout=20)
         if resp.status_code == 429:
-            log("❌ CRITICAL: Reddit 429 Too Many Requests. Rate limited.")
+            log("❌ CRITICAL: Reddit 429 Too Many Requests.")
             sys.exit(1)
         if resp.status_code == 403:
-            log("❌ CRITICAL: Reddit 403 Forbidden. Blocked by Reddit.")
+            log("❌ CRITICAL: Reddit 403 Forbidden.")
             sys.exit(1)
         if resp.status_code != 200:
             log(f"❌ CRITICAL: Reddit returned status {resp.status_code}")
@@ -170,52 +232,42 @@ def main():
     # Process posts
     new_count = 0
     success_count = 0
-    consecutive_523_errors = 0
+    consecutive_failures = 0
     
     for entry in feed.entries:
         post_url = entry.link
         
-        # Skip if already seen
         if post_url in seen:
             continue
         
-        # Check limits
         if new_count >= MAX_POSTS_PER_RUN:
             log(f"⏸️ Reached limit of {MAX_POSTS_PER_RUN} posts per run.")
             break
         
-        # Circuit breaker: Stop if too many 523 errors
-        if consecutive_523_errors >= CIRCUIT_BREAKER_THRESHOLD:
-            log(f"🛑 CIRCUIT BREAKER: {consecutive_523_errors} consecutive 523 errors. Wayback Machine likely down.")
-            log(f"   Skipping remaining posts this run. Will retry next run.")
+        if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+            log(f"🛑 CIRCUIT BREAKER: {consecutive_failures} consecutive failures.")
+            log(f"   All archive services appear down. Will retry next run.")
             break
         
+        log(f"")
         log(f"🆕 Processing: {post_url}")
-        status = archive(post_url)
+        
+        success, service, status = archive_multi_service(post_url)
         new_count += 1
         
-        if status == 200:
-            log(f"   ✅ SUCCESS")
-            append_seen(post_url)
+        if success:
+            log(f"   🎉 ARCHIVED via {service}")
+            append_seen(post_url, service)
             seen.add(post_url)
             success_count += 1
-            consecutive_523_errors = 0  # Reset counter on success
-            
-        elif status == 523:
-            consecutive_523_errors += 1
-            log(f"   ⚠️ FAILED (523) - Consecutive failures: {consecutive_523_errors}/{CIRCUIT_BREAKER_THRESHOLD}")
-            # Don't mark as seen - will retry next run
-            log_failed(post_url, status, skip_archive=False)
+            consecutive_failures = 0
             
         else:
-            log(f"   ⚠️ FAILED ({status})")
-            consecutive_523_errors = 0  # Reset on non-523 errors
-            # Mark as seen to avoid infinite retries of genuinely broken URLs
-            append_seen(post_url)
-            seen.add(post_url)
-            log_failed(post_url, status, skip_archive=True)
+            consecutive_failures += 1
+            log(f"   ⚠️ ALL SERVICES FAILED ({status})")
+            log(f"   Consecutive failures: {consecutive_failures}/{CIRCUIT_BREAKER_THRESHOLD}")
+            log_failed(post_url, status)
         
-        # Sleep between requests
         if new_count < MAX_POSTS_PER_RUN:
             time.sleep(SLEEP_BETWEEN)
     
@@ -227,9 +279,8 @@ def main():
     log(f"   - Failed: {new_count - success_count}")
     log(f"   - Total archived: {len(seen)}")
     
-    if consecutive_523_errors >= CIRCUIT_BREAKER_THRESHOLD:
-        log(f"⚠️  Circuit breaker triggered - Wayback Machine appears to be down")
-        # Exit with 0 so GitHub doesn't mark as failed - this is expected behavior
+    if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+        log(f"⚠️  Circuit breaker triggered")
         sys.exit(0)
 
 if __name__ == "__main__":
