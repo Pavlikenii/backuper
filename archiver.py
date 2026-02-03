@@ -11,9 +11,15 @@ from datetime import datetime
 # ⚙️ CONFIGURATION
 # ==========================================
 SUBREDDIT = os.environ.get("SUBREDDIT", "boltedontits") 
-RSS_URL = f"https://www.reddit.com/r/{SUBREDDIT}/new/.rss"
 SEEN_FILE = "seen.txt"
 FAILED_FILE = "failed.txt"
+
+# 🔗 REDLIB INSTANCE (Proxy to bypass 403 blocks & Age Gates)
+# If this one goes down, try: "redlib.tux.pizza" or "libreddit.freereddit.com"
+REDLIB_INSTANCE = "redlib.catsarch.com" 
+
+# 📡 RSS FEED (Using Redlib to avoid Reddit 403 bans)
+RSS_URL = f"https://{REDLIB_INSTANCE}/r/{SUBREDDIT}/new.rss"
 
 # Real browser headers
 USER_AGENTS = [
@@ -36,9 +42,6 @@ MAX_POSTS_PER_RUN = 5
 MAX_SEEN_ENTRIES = 5000
 CIRCUIT_BREAKER_THRESHOLD = 5
 
-# 🔗 REDLIB INSTANCE (Proxy to strip NSFW gate)
-REDLIB_INSTANCE = "redlib.catsarch.com" 
-
 def log(msg):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {msg}", flush=True)
@@ -51,15 +54,29 @@ def validate_subreddit():
 
 def convert_to_redlib(url):
     """
-    Converts reddit.com -> redlib (Bypasses Age Gate)
+    Converts reddit.com -> redlib
+    1. Bypasses 429/403 blocks on scraping
+    2. Bypasses 'You must be 18+' age gate for Archiving
     """
     clean = url.replace("www.reddit.com", "reddit.com").replace("old.reddit.com", "reddit.com")
+    # Handle cases where the input is already a Redlib URL (from the RSS)
+    if REDLIB_INSTANCE in clean:
+        return clean
     return clean.replace("reddit.com", REDLIB_INSTANCE)
+
+def convert_to_standard(url):
+    """
+    Converts Redlib/Old URLs back to www.reddit.com for consistent deduplication
+    """
+    return url.replace(REDLIB_INSTANCE, "www.reddit.com") \
+              .replace("old.reddit.com", "www.reddit.com") \
+              .replace("reddit.com", "www.reddit.com") \
+              .replace("www.www.", "www.") # Cleanup
 
 def load_seen():
     """
     Loads previously seen URLs.
-    We check the 2nd column (Original Reddit URL) to know if we processed it.
+    Checks column #2 (Original URL) to prevent duplicates.
     """
     if not os.path.exists(SEEN_FILE):
         return set()
@@ -78,7 +95,7 @@ def load_seen():
         if not line: continue
         if '|' in line:
             parts = line.split('|')
-            # parts[0] = Time, parts[1] = Original Reddit URL
+            # Check 2nd column (Original URL)
             if len(parts) >= 2: seen_urls.add(parts[1])
         else:
             seen_urls.add(line)
@@ -86,22 +103,20 @@ def load_seen():
 
 def append_seen(original_url, archived_url, service):
     """
-    Saves the record: TIME | ORIGINAL URL | ARCHIVED URL | SERVICE
+    Saves: TIME | ORIGINAL URL | ARCHIVED URL | SERVICE
     """
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     with open(SEEN_FILE, "a") as f:
         f.write(f"{timestamp}|{original_url}|{archived_url}|{service}\n")
 
 def log_failed(post_url, status):
-    """
-    Logs failures.
-    """
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     with open(FAILED_FILE, "a") as f:
         f.write(f"{timestamp}|{post_url}|{status}\n")
 
 # --- SERVICE 1: WAYBACK MACHINE ---
 def archive_wayback(url):
+    # Ensure we use Redlib URL for archiving to bypass NSFW gate
     target_url = convert_to_redlib(url)
     wayback_url = f"https://web.archive.org/save/{target_url}"
     
@@ -110,7 +125,7 @@ def archive_wayback(url):
         r = requests.get(wayback_url, headers=get_headers(), timeout=ARCHIVE_TIMEOUT)
         
         if r.status_code == 200:
-            return (200, r.url) # r.url is the final Wayback link
+            return (200, r.url) 
         return (r.status_code, None)
     except Exception as e:
         return (f"Error: {str(e)[:50]}", None)
@@ -119,14 +134,17 @@ def archive_wayback(url):
 def archive_ghost(url):
     try:
         log(f"      [GhostArchive] Attempting...")
+        # GhostArchive often works better with the Real Reddit URL
+        real_url = convert_to_standard(url)
+        
         r = requests.post(
             "https://ghostarchive.org/archive", 
-            data={'url': url}, 
+            data={'url': real_url}, 
             headers=get_headers(), 
             timeout=60
         )
         if r.status_code == 200 and "ghostarchive.org/archive/" in r.url:
-            return (200, r.url) # r.url is the GhostArchive link
+            return (200, r.url)
         return (r.status_code, None)
     except Exception as e:
         return (f"Error: {str(e)[:50]}", None)
@@ -135,14 +153,17 @@ def archive_ghost(url):
 def archive_today(url):
     try:
         log(f"      [Archive.today] Attempting...")
+        # Archive.today works with Real URL
+        real_url = convert_to_standard(url)
+        
         r = requests.post(
             "https://archive.ph/submit/",
-            data={'url': url, 'anyway': '1'},
+            data={'url': real_url, 'anyway': '1'},
             headers=get_headers(),
             timeout=ARCHIVE_TIMEOUT
         )
         if r.status_code == 200 and 'archive.ph' in r.url:
-            return (200, r.url) # r.url is the Archive.today link
+            return (200, r.url)
         return (r.status_code, None)
     except Exception as e:
         return (f"Error: {str(e)[:50]}", None)
@@ -181,6 +202,7 @@ def archive_multi_service(url):
 
 def main():
     log(f"--- 🚀 STARTING ARCHIVER FOR r/{SUBREDDIT} ---")
+    log(f"📡 Source: {RSS_URL}")
     
     if not validate_subreddit():
         sys.exit(1)
@@ -188,17 +210,21 @@ def main():
     seen = load_seen()
     
     try:
-        resp = requests.get(RSS_URL, headers=get_headers(), timeout=20)
+        # Fetch RSS from Redlib
+        resp = requests.get(RSS_URL, headers=get_headers(), timeout=30)
+        
+        # If the main Redlib instance fails, fail gracefully (or you could add logic to try another)
         if resp.status_code != 200:
-            log(f"❌ CRITICAL: Reddit RSS status {resp.status_code}")
+            log(f"❌ CRITICAL: Redlib RSS returned status {resp.status_code}")
             sys.exit(1)
+            
         feed = feedparser.parse(resp.text)
     except Exception as e:
         log(f"❌ CRITICAL: RSS Parse Error: {e}")
         sys.exit(1)
     
     if not feed.entries:
-        log("⚠️ No posts found.")
+        log("⚠️ No posts found in feed (feed might be empty or restricted).")
         return
     
     log(f"📊 Found {len(feed.entries)} posts.")
@@ -208,10 +234,11 @@ def main():
     
     for entry in feed.entries:
         post_url = entry.link
-        # Use Standard URL for deduplication check
-        check_url = post_url.replace("old.reddit.com", "www.reddit.com")
         
-        if check_url in seen:
+        # Convert link to standard reddit format for deduplication checking
+        standard_url = convert_to_standard(post_url)
+        
+        if standard_url in seen:
             continue
             
         if new_count >= MAX_POSTS_PER_RUN:
@@ -222,19 +249,19 @@ def main():
             log(f"🛑 Too many failures. Stopping run.")
             break
             
-        log(f"\n🆕 Processing: {check_url}")
-        success, service, result_link = archive_multi_service(check_url)
+        log(f"\n🆕 Processing: {standard_url}")
+        
+        # We pass the standard URL to the archiver, it will handle conversion internally
+        success, service, result_link = archive_multi_service(standard_url)
         new_count += 1
         
         if success:
-            # SAVE THE ARCHIVED URL HERE
-            append_seen(check_url, result_link, service)
-            seen.add(check_url)
+            append_seen(standard_url, result_link, service)
+            seen.add(standard_url)
             consecutive_failures = 0
         else:
             consecutive_failures += 1
-            # For failures, result_link contains error codes
-            log_failed(check_url, result_link)
+            log_failed(standard_url, result_link)
         
         if new_count < MAX_POSTS_PER_RUN:
             time.sleep(SLEEP_BETWEEN + random.uniform(1, 5))
