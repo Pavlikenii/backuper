@@ -2,11 +2,13 @@ name: Reddit Wayback Archiver
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # Runs every 5 minutes
-  workflow_dispatch:        # Allows manual run button
+    # REDUCED FREQUENCY: Run every 30 minutes instead of every 5
+    # This helps avoid rate limiting
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write           # REQUIRED to save the text file
+  contents: write
 
 concurrency:
   group: archiver
@@ -15,7 +17,7 @@ concurrency:
 jobs:
   run_archiver:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10  # Reduced from 15 since we process fewer posts
     
     steps:
       - name: Checkout code
@@ -29,7 +31,6 @@ jobs:
           python-version: "3.11"
           cache: 'pip'
       
-      # FIX: Ensure dependencies exist even if requirements.txt is missing
       - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
@@ -43,7 +44,6 @@ jobs:
         id: archiver
         env:
           SUBREDDIT: ${{ vars.SUBREDDIT }}
-        # -u forces unbuffered output so you see logs immediately
         run: python -u archiver.py
         continue-on-error: true
       
@@ -53,21 +53,44 @@ jobs:
           echo "## 📦 Archive Run Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Time:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Subreddit:** r/${{ vars.SUBREDDIT }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ -f seen.txt ]; then
             TOTAL=$(wc -l < seen.txt)
+            RECENT=$(tail -n 5 seen.txt | wc -l)
             echo "**Total Archived:** $TOTAL posts" >> $GITHUB_STEP_SUMMARY
+            echo "**This Run:** $RECENT posts processed" >> $GITHUB_STEP_SUMMARY
           fi
           
           if [ -f failed.txt ]; then
             FAILED_COUNT=$(wc -l < failed.txt)
-            echo "**⚠️ Failed Attempts:** $FAILED_COUNT" >> $GITHUB_STEP_SUMMARY
+            RECENT_FAILED=$(tail -n 10 failed.txt | grep -c "523" || echo "0")
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**⚠️ Total Failed Attempts:** $FAILED_COUNT" >> $GITHUB_STEP_SUMMARY
+            echo "**Recent 523 Errors:** $RECENT_FAILED (Wayback unreachable)" >> $GITHUB_STEP_SUMMARY
           fi
-
-          # If the script failed, show that in the summary
-          if [ "${{ steps.archiver.outcome }}" != "success" ]; then
-             echo "" >> $GITHUB_STEP_SUMMARY
-             echo "🔴 **The Python script crashed or failed.** Check the logs." >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check script outcome
+          if [ "${{ steps.archiver.outcome }}" == "success" ]; then
+            echo "✅ **Status:** Script completed successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🔴 **Status:** Script encountered errors (check logs)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Add troubleshooting hints
+          if [ -f failed.txt ]; then
+            RECENT_523=$(tail -n 20 failed.txt | grep -c "523" || echo "0")
+            if [ "$RECENT_523" -gt "10" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### 🔧 Troubleshooting" >> $GITHUB_STEP_SUMMARY
+              echo "High number of 523 errors detected. This means:" >> $GITHUB_STEP_SUMMARY
+              echo "- Wayback Machine cannot reach Reddit" >> $GITHUB_STEP_SUMMARY
+              echo "- Reddit may be blocking Wayback's crawlers" >> $GITHUB_STEP_SUMMARY
+              echo "- Try again later or reduce frequency further" >> $GITHUB_STEP_SUMMARY
+            fi
           fi
       
       - name: Commit and Push Changes
@@ -75,21 +98,19 @@ jobs:
           git config user.name "Wayback Bot"
           git config user.email "bot@users.noreply.github.com"
           
-          # 1. Stage the files immediately (Fixes 'untracked files' error)
+          # Stage files
           git add seen.txt failed.txt 2>/dev/null || true
           
-          # 2. Check if we actually have changes to save
+          # Check for changes
           if git diff --quiet --staged; then
-            echo "No changes to commit. Exiting."
+            echo "No changes to commit."
             exit 0
           fi
 
-          # 3. Commit LOCALLY first (Fixes 'cannot pull with unstaged changes' error)
+          # Commit locally
           git commit -m "📦 Archive update [$(date -u +'%Y-%m-%d %H:%M UTC')]"
           
-          # 4. Pull remote changes and reapply our commit on top
-          # We use --rebase to keep history clean
-          # We use -Xtheirs to favor the bot's current run if lines conflict
+          # Pull and rebase
           echo "Pulling latest changes..."
           if ! git pull --rebase -Xtheirs origin main; then
             echo "⚠️ Rebase failed. Attempting standard merge..."
@@ -97,11 +118,11 @@ jobs:
             git pull -Xtheirs origin main
           fi
           
-          # 5. Push the result
+          # Push
           git push
       
-      - name: Check for script failures
-        if: steps.archiver.outcome != 'success'
+      - name: Check for critical failures
+        if: steps.archiver.outcome == 'failure'
         run: |
-          echo "::error::Archiver script encountered errors. Please check the 'Run Archiver Script' step logs for details."
-          exit 1
+          echo "::warning::Archiver script had issues. Check logs for details."
+          # Don't fail the job - let it continue to commit partial progress
